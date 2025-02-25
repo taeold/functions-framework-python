@@ -40,6 +40,10 @@ REGISTRY_MAP = {}
 # Keys are the user function name, values are the type of the function input
 INPUT_TYPE_MAP = {}
 
+# ASYNC_FUNCTIONS tracks which functions are async/coroutines
+# Keys are user function names, values are boolean (True if async)
+ASYNC_FUNCTIONS = {}
+
 
 def get_user_function(source, source_module, target):
     """Returns user function, raises exception for invalid function."""
@@ -127,6 +131,18 @@ def get_func_signature_type(func_name: str, signature_type: str) -> str:
     if os.environ.get("ENTRY_POINT"):
         os.environ["FUNCTION_TRIGGER_TYPE"] = sig_type
     return sig_type
+
+
+def is_async_func(func_name: str) -> bool:
+    """Check if a function is async/coroutine.
+    
+    Args:
+        func_name: The name of the function to check
+    
+    Returns:
+        True if the function is marked as async, False otherwise
+    """
+    return ASYNC_FUNCTIONS.get(func_name, False)
 
 
 def get_func_input_type(func_name: str) -> Type:

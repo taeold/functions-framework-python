@@ -57,6 +57,13 @@ setup(
         "cloudevents>=1.2.0,<2.0.0",
         "Werkzeug>=0.14,<4.0.0",
     ],
+    extras_require={
+        "asgi": [
+            "starlette>=0.20.0",
+            "uvicorn>=0.18.0",
+            "httpx>=0.24.0",  # For TestClient and other HTTP utilities
+        ],
+    },
     entry_points={
         "console_scripts": [
             "ff=functions_framework._cli:_cli",

@@ -16,7 +16,7 @@ import os
 
 import click
 
-from functions_framework import create_app
+from functions_framework import create_app, create_asgi_app
 from functions_framework._http import create_server
 
 
@@ -32,6 +32,17 @@ from functions_framework._http import create_server
 @click.option("--host", envvar="HOST", type=click.STRING, default="0.0.0.0")
 @click.option("--port", envvar="PORT", type=click.INT, default=8080)
 @click.option("--debug", envvar="DEBUG", is_flag=True)
-def _cli(target, source, signature_type, host, port, debug):
-    app = create_app(target, source, signature_type)
-    create_server(app, debug).run(host, port)
+@click.option(
+    "--framework",
+    envvar="FUNCTION_FRAMEWORK",
+    type=click.Choice(["wsgi", "asgi"]),
+    default="wsgi",
+    help="Web framework to use (wsgi for Flask, asgi for Starlette)",
+)
+def _cli(target, source, signature_type, host, port, debug, framework):
+    if framework == "asgi":
+        app = create_asgi_app(target, source, signature_type)
+    else:
+        app = create_app(target, source, signature_type)
+    
+    create_server(app, debug, framework).run(host, port)

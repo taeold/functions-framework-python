@@ -380,3 +380,125 @@ async def test_maintains_execution_id_for_concurrent_requests(monkeypatch, capsy
 
     sort_key = lambda d: d["message"]
     assert sorted(logs_as_json, key=sort_key) == sorted(expected_logs, key=sort_key)
+
+
+@pytest.mark.asyncio
+async def test_asgi_middleware():
+    """Test AsgiMiddleware adds execution ID to request."""
+    # Create a stub ASGI app to check headers
+    received_headers = []
+    
+    async def app(scope, receive, send):
+        # Store headers for verification
+        received_headers.extend(scope.get("headers", []))
+        # Send a simple response
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/plain")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b"OK",
+        })
+    
+    # Apply the middleware
+    middleware = execution_id.AsgiMiddleware(app)
+    
+    # Create a request scope without execution ID
+    scope = {
+        "type": "http",
+        "headers": [],
+    }
+    
+    # Mock receive and send functions
+    async def receive():
+        return {"type": "http.request"}
+    
+    async def send(message):
+        pass
+    
+    # Run the middleware
+    await middleware(scope, receive, send)
+    
+    # Find the execution ID header
+    execution_id_header = None
+    for header_name, header_value in received_headers:
+        if header_name.decode().lower() == execution_id.EXECUTION_ID_REQUEST_HEADER.lower():
+            execution_id_header = header_value.decode()
+            break
+    
+    # Verify execution ID was added
+    assert execution_id_header is not None
+    assert len(execution_id_header) == execution_id._EXECUTION_ID_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_set_asgi_execution_context_async():
+    """Test set_asgi_execution_context with async function."""
+    # Create a request with execution ID
+    request = pretend.stub(
+        headers={
+            execution_id.EXECUTION_ID_REQUEST_HEADER: TEST_EXECUTION_ID,
+            execution_id.TRACE_CONTEXT_REQUEST_HEADER: f"TRACE_ID/{TEST_SPAN_ID};o=1",
+        }
+    )
+    
+    # Create an async function to decorate
+    async def async_view_func(request):
+        # Check context is set
+        context = execution_id._get_current_context()
+        assert context.execution_id == TEST_EXECUTION_ID
+        assert context.span_id == TEST_SPAN_ID
+        
+        # Test context remains after await
+        await asyncio.sleep(0.01)
+        context_after_await = execution_id._get_current_context()
+        assert context_after_await.execution_id == TEST_EXECUTION_ID
+        assert context_after_await.span_id == TEST_SPAN_ID
+        
+        return "test"
+    
+    # Apply the decorator 
+    decorated_func = execution_id.set_asgi_execution_context()(async_view_func)
+    
+    # Call the function
+    result = await decorated_func(request)
+    
+    # Verify result
+    assert result == "test"
+    
+    # Verify context is cleaned up after function completes
+    assert execution_id._get_current_context() is None
+
+
+@pytest.mark.asyncio
+async def test_set_asgi_execution_context_sync():
+    """Test set_asgi_execution_context with sync function."""
+    # Create a request with execution ID
+    request = pretend.stub(
+        headers={
+            execution_id.EXECUTION_ID_REQUEST_HEADER: TEST_EXECUTION_ID,
+            execution_id.TRACE_CONTEXT_REQUEST_HEADER: f"TRACE_ID/{TEST_SPAN_ID};o=1",
+        }
+    )
+    
+    # Create a sync function to decorate
+    def sync_view_func(request):
+        # Check context is set
+        context = execution_id._get_current_context()
+        assert context.execution_id == TEST_EXECUTION_ID
+        assert context.span_id == TEST_SPAN_ID
+        return "test"
+    
+    # Apply the decorator 
+    decorated_func = execution_id.set_asgi_execution_context()(sync_view_func)
+    
+    # Call the function
+    result = await decorated_func(request)
+    
+    # Verify result
+    assert result == "test"
+    
+    # Verify context is cleaned up after function completes
+    assert execution_id._get_current_context() is None

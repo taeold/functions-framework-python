@@ -31,70 +31,130 @@ def test_cli_no_arguments():
 
 
 @pytest.mark.parametrize(
-    "args, env, create_app_calls, run_calls",
+    "args, env, create_app_calls, create_asgi_app_calls, framework, run_calls",
     [
         (
             ["--target", "foo"],
             {},
             [pretend.call("foo", None, "http")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             [],
             {"FUNCTION_TARGET": "foo"},
             [pretend.call("foo", None, "http")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             ["--target", "foo", "--source", "/path/to/source.py"],
             {},
             [pretend.call("foo", "/path/to/source.py", "http")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             [],
             {"FUNCTION_TARGET": "foo", "FUNCTION_SOURCE": "/path/to/source.py"},
             [pretend.call("foo", "/path/to/source.py", "http")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             ["--target", "foo", "--signature-type", "event"],
             {},
             [pretend.call("foo", None, "event")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             [],
             {"FUNCTION_TARGET": "foo", "FUNCTION_SIGNATURE_TYPE": "event"},
             [pretend.call("foo", None, "event")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             ["--target", "foo", "--host", "127.0.0.1"],
             {},
             [pretend.call("foo", None, "http")],
+            [],
+            "wsgi",
             [pretend.call("127.0.0.1", 8080)],
         ),
         (
             ["--target", "foo", "--debug"],
             {},
             [pretend.call("foo", None, "http")],
+            [],
+            "wsgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
         (
             [],
             {"FUNCTION_TARGET": "foo", "DEBUG": "True"},
             [pretend.call("foo", None, "http")],
+            [],
+            "wsgi",
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+        # Test ASGI framework parameter
+        (
+            ["--target", "foo", "--framework", "asgi"],
+            {},
+            [],
+            [pretend.call("foo", None, "http")],
+            "asgi",
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+        # Test ASGI via environment variable
+        (
+            ["--target", "foo"],
+            {"FUNCTION_FRAMEWORK": "asgi"},
+            [],
+            [pretend.call("foo", None, "http")],
+            "asgi",
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+        # Test ASGI with signature-type
+        (
+            ["--target", "foo", "--framework", "asgi", "--signature-type", "cloudevent"],
+            {},
+            [],
+            [pretend.call("foo", None, "cloudevent")],
+            "asgi",
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+        # Test ASGI with debug mode
+        (
+            ["--target", "foo", "--framework", "asgi", "--debug"],
+            {},
+            [],
+            [pretend.call("foo", None, "http")],
+            "asgi",
             [pretend.call("0.0.0.0", 8080)],
         ),
     ],
 )
-def test_cli(monkeypatch, args, env, create_app_calls, run_calls):
-    wsgi_server = pretend.stub(run=pretend.call_recorder(lambda *a, **kw: None))
-    wsgi_app = pretend.stub(run=pretend.call_recorder(lambda *a, **kw: None))
+def test_cli(monkeypatch, args, env, create_app_calls, create_asgi_app_calls, framework, run_calls):
+    server = pretend.stub(run=pretend.call_recorder(lambda *a, **kw: None))
+    wsgi_app = pretend.stub()
+    asgi_app = pretend.stub()
+    
     create_app = pretend.call_recorder(lambda *a, **kw: wsgi_app)
+    create_asgi_app = pretend.call_recorder(lambda *a, **kw: asgi_app)
+    
     monkeypatch.setattr(functions_framework._cli, "create_app", create_app)
-    create_server = pretend.call_recorder(lambda *a, **kw: wsgi_server)
+    monkeypatch.setattr(functions_framework._cli, "create_asgi_app", create_asgi_app)
+    
+    create_server = pretend.call_recorder(lambda app, debug, framework="wsgi", **kw: server)
     monkeypatch.setattr(functions_framework._cli, "create_server", create_server)
 
     runner = CliRunner(env=env)
@@ -102,4 +162,17 @@ def test_cli(monkeypatch, args, env, create_app_calls, run_calls):
 
     assert result.exit_code == 0
     assert create_app.calls == create_app_calls
-    assert wsgi_server.run.calls == run_calls
+    assert create_asgi_app.calls == create_asgi_app_calls
+    
+    # Check that the correct app was passed to create_server
+    if framework == "wsgi":
+        expected_app = wsgi_app
+    else:
+        expected_app = asgi_app
+    
+    # Verify the first argument to create_server is the correct app
+    # (we only check this when there's exactly one call)
+    if len(create_server.calls) == 1:
+        assert create_server.calls[0].args[0] == expected_app
+    
+    assert server.run.calls == run_calls

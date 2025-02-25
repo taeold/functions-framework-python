@@ -317,6 +317,7 @@ You can configure the Functions Framework using command-line flags or environmen
 | `--signature-type` | `FUNCTION_SIGNATURE_TYPE` | The signature used when writing your function. Controls unmarshalling rules and determines which arguments are used to invoke your function. Default: `http`; accepted values: `http`, `event` or `cloudevent` |
 | `--source`         | `FUNCTION_SOURCE`         | The path to the file containing your function. Default: `main.py` (in the current working directory)                                                                                             |
 | `--debug`          | `DEBUG`                   | A flag that allows to run functions-framework to run in debug mode, including live reloading. Default: `False`                                                                                   |
+| `--framework`      | `FUNCTION_FRAMEWORK`      | The web framework to use for serving functions. Default: `wsgi`; accepted values: `wsgi` (Flask) or `asgi` (Starlette)                                                                           |
 
 ## Enable Google Cloud Run function Events
 
@@ -345,6 +346,35 @@ See the [running example](examples/cloud_run_event).
 
 More advanced guides can be found in the [`examples/`](examples/) directory.
 You can also find examples on using the CloudEvent Python SDK [here](https://github.com/cloudevents/sdk-python).
+
+### Async Functions with ASGI
+
+Functions Framework now supports asynchronous Python functions using the ASGI framework.
+To use this feature, install the required dependencies:
+
+```sh
+pip install "functions-framework[asgi]"
+```
+
+Then, you can write asynchronous functions:
+
+```python
+import asyncio
+import functions_framework
+
+@functions_framework.http
+async def hello_async(request):
+    await asyncio.sleep(1)  # Some async operation
+    return {"message": "Hello async world!"}
+```
+
+Run the function with the ASGI framework:
+
+```sh
+functions-framework --target=hello_async --framework=asgi
+```
+
+See the [async_function example](examples/async_function/) for more details.
 
 ## Contributing
 

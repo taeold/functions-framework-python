@@ -22,52 +22,84 @@ import pytest
 import functions_framework._http
 
 
-@pytest.mark.parametrize("debug", [True, False])
-def test_create_server(monkeypatch, debug):
+@pytest.mark.parametrize("debug, framework", [
+    (True, "wsgi"),
+    (False, "wsgi"),
+    (True, "asgi"),
+    (False, "asgi"),
+])
+def test_create_server(monkeypatch, debug, framework):
     server_stub = pretend.stub()
     httpserver = pretend.call_recorder(lambda *a, **kw: server_stub)
     monkeypatch.setattr(functions_framework._http, "HTTPServer", httpserver)
-    wsgi_app = pretend.stub()
+    app = pretend.stub()
     options = {"a": pretend.stub(), "b": pretend.stub()}
 
-    functions_framework._http.create_server(wsgi_app, debug, **options)
+    functions_framework._http.create_server(app, debug, framework, **options)
 
-    assert httpserver.calls == [pretend.call(wsgi_app, debug, **options)]
+    assert httpserver.calls == [pretend.call(app, debug, framework, **options)]
 
 
 @pytest.mark.parametrize(
-    "debug, gunicorn_missing, expected",
+    "debug, framework, gunicorn_missing, uvicorn_missing, expected",
     [
-        (True, False, "flask"),
-        (False, False, "flask" if platform.system() == "Windows" else "gunicorn"),
-        (True, True, "flask"),
-        (False, True, "flask"),
+        # WSGI tests
+        (True, "wsgi", False, False, "flask"),
+        (False, "wsgi", False, False, "flask" if platform.system() == "Windows" else "gunicorn"),
+        (True, "wsgi", True, False, "flask"),
+        (False, "wsgi", True, False, "flask"),
+        
+        # ASGI tests
+        (True, "asgi", False, False, "flask"),  # Debug mode always uses Flask even for ASGI
+        (False, "asgi", False, False, "gunicorn_uvicorn"),
+        (False, "asgi", False, True, "gunicorn"),  # Fallback to regular Gunicorn if Uvicorn missing
+        (False, "asgi", True, False, "flask"),  # Fallback to Flask if Gunicorn missing
     ],
 )
-def test_httpserver(monkeypatch, debug, gunicorn_missing, expected):
+def test_httpserver(monkeypatch, debug, framework, gunicorn_missing, uvicorn_missing, expected):
     app = pretend.stub()
     http_server = pretend.stub(run=pretend.call_recorder(lambda: None))
     server_classes = {
         "flask": pretend.call_recorder(lambda *a, **kw: http_server),
         "gunicorn": pretend.call_recorder(lambda *a, **kw: http_server),
+        "gunicorn_uvicorn": pretend.call_recorder(lambda *a, **kw: http_server),
     }
     options = {"a": pretend.stub(), "b": pretend.stub()}
 
+    # Set up the Flask application class
     monkeypatch.setattr(
         functions_framework._http, "FlaskApplication", server_classes["flask"]
     )
+    
+    # Handle Gunicorn imports
     if gunicorn_missing or platform.system() == "Windows":
         monkeypatch.setitem(sys.modules, "functions_framework._http.gunicorn", None)
     else:
         from functions_framework._http import gunicorn
-
         monkeypatch.setattr(gunicorn, "GunicornApplication", server_classes["gunicorn"])
+    
+    # Handle ASGI imports
+    if uvicorn_missing:
+        monkeypatch.setitem(sys.modules, "functions_framework._http.asgi", None)
+    else:
+        # Only mock this if we're not mocking gunicorn as missing
+        if not gunicorn_missing:
+            try:
+                from functions_framework._http import asgi
+                monkeypatch.setattr(asgi, "GunicornUvicornApplication", server_classes["gunicorn_uvicorn"])
+            except ImportError:
+                # If the module doesn't exist yet (during test development), create a mock
+                asgi_module = types.ModuleType("functions_framework._http.asgi")
+                asgi_module.GunicornUvicornApplication = server_classes["gunicorn_uvicorn"]
+                sys.modules["functions_framework._http.asgi"] = asgi_module
+                monkeypatch.setattr(functions_framework._http, "asgi", asgi_module)
 
-    wrapper = functions_framework._http.HTTPServer(app, debug, **options)
+    wrapper = functions_framework._http.HTTPServer(app, debug, framework, **options)
 
     assert wrapper.app == app
     assert wrapper.server_class == server_classes[expected]
     assert wrapper.options == options
+    assert wrapper.framework == framework
 
     host = pretend.stub()
     port = pretend.stub()

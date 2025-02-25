@@ -23,9 +23,10 @@ import os.path
 import pathlib
 import sys
 import types
+import asyncio
 
 from inspect import signature
-from typing import Callable, Type
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import cloudevents.exceptions as cloud_exceptions
 import flask
@@ -55,6 +56,8 @@ _CLOUDEVENT_MIME_TYPE = "application/cloudevents+json"
 
 CloudEventFunction = Callable[[CloudEvent], None]
 HTTPFunction = Callable[[flask.Request], flask.typing.ResponseReturnValue]
+AsyncCloudEventFunction = Callable[[CloudEvent], Any]
+AsyncHTTPFunction = Callable[[Any], Any]  # Will be used with Starlette Request
 
 
 class _LoggingHandler(io.TextIOWrapper):
@@ -70,11 +73,14 @@ class _LoggingHandler(io.TextIOWrapper):
         return self.stderr.write(json.dumps(payload) + "\n")
 
 
-def cloud_event(func: CloudEventFunction) -> CloudEventFunction:
+def cloud_event(func: Union[CloudEventFunction, AsyncCloudEventFunction]) -> Union[CloudEventFunction, AsyncCloudEventFunction]:
     """Decorator that registers cloudevent as user function signature type."""
     _function_registry.REGISTRY_MAP[func.__name__] = (
         _function_registry.CLOUDEVENT_SIGNATURE_TYPE
     )
+    
+    # Store whether the function is async or not
+    _function_registry.ASYNC_FUNCTIONS[func.__name__] = inspect.iscoroutinefunction(func)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -110,11 +116,14 @@ def typed(*args):
         return _typed
 
 
-def http(func: HTTPFunction) -> HTTPFunction:
+def http(func: Union[HTTPFunction, AsyncHTTPFunction]) -> Union[HTTPFunction, AsyncHTTPFunction]:
     """Decorator that registers http as user function signature type."""
     _function_registry.REGISTRY_MAP[func.__name__] = (
         _function_registry.HTTP_SIGNATURE_TYPE
     )
+    
+    # Store whether the function is async or not
+    _function_registry.ASYNC_FUNCTIONS[func.__name__] = inspect.iscoroutinefunction(func)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -327,6 +336,7 @@ def crash_handler(e):
 
 
 def create_app(target=None, source=None, signature_type=None):
+    """Create a Flask WSGI application for the function."""
     target = _function_registry.get_function_target(target)
     source = _function_registry.get_function_source(source)
 
@@ -400,6 +410,234 @@ def create_app(target=None, source=None, signature_type=None):
     _configure_app(_app, function, signature_type)
 
     return _app
+
+
+def create_asgi_app(target: Optional[str] = None, 
+                source: Optional[str] = None, 
+                signature_type: Optional[str] = None) -> Any:
+    """Create a Starlette ASGI application for the function.
+    
+    Args:
+        target: The name of the target function to invoke
+        source: The source file containing the function
+        signature_type: The signature type of the function
+                       ('http', 'event', 'cloudevent', or 'typed')
+    
+    Returns:
+        A Starlette ASGI application instance
+        
+    Raises:
+        ImportError: If Starlette is not installed
+        MissingSourceException: If the source file does not exist
+        FunctionsFrameworkException: If the signature type is invalid
+    """
+    try:
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response, PlainTextResponse
+        import asyncio
+        from starlette.routing import Route
+        from starlette.middleware import Middleware
+    except ImportError:
+        raise ImportError(
+            "Starlette is required for ASGI support. "
+            "Install with: pip install starlette"
+        )
+
+    target = _function_registry.get_function_target(target)
+    source = _function_registry.get_function_source(source)
+
+    if not os.path.exists(source):
+        raise MissingSourceException(
+            f"File {source} that is expected to define function doesn't exist"
+        )
+
+    source_module, spec = _function_registry.load_function_module(source)
+
+    # Load the module and function
+    try:
+        spec.loader.exec_module(source_module)
+        function = _function_registry.get_user_function(source, source_module, target)
+    except Exception as e:
+        # When not debugging, raise the error immediately
+        raise e from None
+
+    # Get the configured function signature type
+    signature_type = _function_registry.get_func_signature_type(target, signature_type)
+    is_async = _function_registry.is_async_func(target)
+    
+    # Setup execution context for logging
+    enable_id_logging = _enable_execution_id_logging()
+
+    # Define route handlers for each signature type
+    @execution_id.set_asgi_execution_context(enable_id_logging)
+    async def http_handler(request):
+        if is_async:
+            result = await function(request)
+        else:
+            # Run sync function in an executor
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, function, request)
+        
+        # Convert result to a Starlette response
+        if isinstance(result, Response):
+            return result
+        elif isinstance(result, (dict, list)):
+            return JSONResponse(result)
+        elif isinstance(result, tuple) and len(result) == 2:
+            content, status_code = result
+            return PlainTextResponse(str(content), status_code=status_code)
+        else:
+            return PlainTextResponse(str(result) if result is not None else "")
+
+    @execution_id.set_asgi_execution_context(enable_id_logging)
+    async def cloud_event_handler(request):
+        """Handle CloudEvent requests for ASGI.
+        
+        This handler:
+        1. Tries to parse a CloudEvent from the request
+        2. Falls back to background event conversion if that fails
+        3. Runs the function with the event (async or sync)
+        """
+        try:
+            # First try to parse as a native CloudEvent
+            body = await request.body()
+            # Handle headers from Starlette (case-insensitive dict-like object)
+            headers = {k.lower(): v for k, v in request.headers.items()}
+            
+            # Parse the CloudEvent using CloudEvents SDK
+            event = from_http(headers, body)
+            
+            # Execute the function based on whether it's async or not
+            if is_async:
+                await function(event)
+            else:
+                # Run sync function in an executor to avoid blocking
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, function, event)
+                
+            return PlainTextResponse("OK")
+        except Exception as first_error:
+            # CloudEvent parsing failed, try background event conversion
+            try:
+                # Create an adapter for the Starlette request to make it compatible
+                # with our background event conversion function
+                class RequestAdapter:
+                    """Adapter to make Starlette request compatible with event conversion."""
+                    def __init__(self, original_request):
+                        self.original_request = original_request
+                        self.headers = original_request.headers
+                        self.path = original_request.url.path
+                    
+                    async def get_json(self):
+                        """Async method to get JSON data from request."""
+                        return await self.original_request.json()
+                
+                # Create adapter from the original request
+                adapted_request = RequestAdapter(request)
+                
+                # Try converting from background event format
+                event = await event_conversion.background_event_to_cloud_event_async(adapted_request)
+                
+                # Execute the function based on whether it's async or not
+                if is_async:
+                    await function(event)
+                else:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, function, event)
+                
+                return PlainTextResponse("OK")
+            except EventConversionException as e:
+                # Both parsing methods failed - return detailed error
+                error_detail = (
+                    f"Failed to parse as CloudEvent: {str(first_error)}\n"
+                    f"Failed to convert from background event: {str(e)}"
+                )
+                return PlainTextResponse(
+                    f"Invalid event format: {error_detail}", 
+                    status_code=400
+                )
+
+    @execution_id.set_asgi_execution_context(enable_id_logging)
+    async def event_handler(request):
+        # Handling for background events
+        try:
+            event_data = await request.json()
+            event_object = BackgroundEvent(**event_data)
+            data = event_object.data
+            context = Context(**event_object.context)
+            
+            if is_async:
+                await function(data, context)
+            else:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, function, data, context)
+                
+            return PlainTextResponse("OK")
+        except Exception as e:
+            return PlainTextResponse(str(e), status_code=400)
+
+    # Map signature types to route handlers
+    handler_map = {
+        _function_registry.HTTP_SIGNATURE_TYPE: http_handler,
+        _function_registry.CLOUDEVENT_SIGNATURE_TYPE: cloud_event_handler,
+        _function_registry.BACKGROUNDEVENT_SIGNATURE_TYPE: event_handler,
+    }
+    
+    # Select the appropriate handler based on signature type
+    if signature_type not in handler_map:
+        raise FunctionsFrameworkException(f"Invalid signature type: {signature_type}")
+    
+    handler = handler_map[signature_type]
+    
+    # Define routes based on signature type
+    if signature_type == _function_registry.HTTP_SIGNATURE_TYPE:
+        routes = [
+            Route("/", handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
+            Route("/{path:path}", handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
+        ]
+    else:
+        # For event-based handlers, only accept POST
+        routes = [
+            Route("/", handler, methods=["POST"]),
+            Route("/{path:path}", handler, methods=["POST"]),
+        ]
+    
+    # Add the execution ID middleware
+    middleware = [
+        Middleware(execution_id.AsgiMiddleware)
+    ]
+    
+    # Create and return Starlette app with middleware
+    app = Starlette(
+        debug=bool(os.environ.get("DEBUG")), 
+        routes=routes,
+        middleware=middleware
+    )
+    
+    # Error handler for crash reports
+    @app.exception_handler(Exception)
+    async def exception_handler(request, exc):
+        # Log the exception for debugging
+        import traceback
+        error_message = f"Function execution failed: {str(exc)}\n"
+        error_message += traceback.format_exc()
+        import logging
+        logging.error(error_message)
+        
+        # Return a structured error response similar to the WSGI version
+        error_response = {
+            "error": str(exc),
+            "stacktrace": traceback.format_exc()
+        }
+        
+        return JSONResponse(
+            content=error_response,
+            status_code=500,
+            headers={_FUNCTION_STATUS_HEADER_FIELD: _CRASH}
+        )
+    
+    return app
 
 
 class LazyWSGIApp:

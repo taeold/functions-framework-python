@@ -14,10 +14,11 @@
 import re
 
 from datetime import datetime
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from cloudevents.exceptions import MissingRequiredFields
 from cloudevents.http import CloudEvent, from_http, is_binary
+import asyncio
 
 from functions_framework.background_event import BackgroundEvent
 from functions_framework.exceptions import EventConversionException
@@ -184,6 +185,76 @@ def background_event_to_cloud_event(request) -> CloudEvent:
     return CloudEvent(metadata, data)
 
 
+async def background_event_to_cloud_event_async(request) -> CloudEvent:
+    """Async version of background_event_to_cloud_event for ASGI frameworks."""
+    event_data = await marshal_background_event_data_async(request)
+    if not event_data:
+        raise EventConversionException("Failed to parse JSON")
+
+    event_object = BackgroundEvent(**event_data)
+    data = event_object.data
+    context = Context(**event_object.context)
+
+    if context.event_type not in _BACKGROUND_TO_CE_TYPE:
+        raise EventConversionException(
+            f'Unable to find CloudEvent equivalent type for "{context.event_type}"'
+        )
+    new_type = _BACKGROUND_TO_CE_TYPE[context.event_type]
+
+    service, resource, subject = _split_resource(context)
+    source = f"//{service}/{resource}"
+
+    # Handle Pub/Sub events.
+    if service == _PUBSUB_CE_SERVICE:
+        if "messageId" not in data:
+            data["messageId"] = context.event_id
+        if "publishTime" not in data:
+            data["publishTime"] = context.timestamp
+        data = {"message": data}
+
+    # Handle Firebase Auth events.
+    if service == _FIREBASE_AUTH_CE_SERVICE:
+        if "metadata" in data:
+            for old, new in _FIREBASE_AUTH_METADATA_FIELDS_BACKGROUND_TO_CE.items():
+                if old in data["metadata"]:
+                    data["metadata"][new] = data["metadata"][old]
+                    del data["metadata"][old]
+        if "uid" in data:
+            uid = data["uid"]
+            subject = f"users/{uid}"
+
+    # Handle Firebase DB events.
+    if service == _FIREBASE_DB_CE_SERVICE:
+        # The CE source of firebasedatabase CloudEvents includes location information
+        # that is inferred from the 'domain' field of legacy events.
+        if "domain" not in event_data:
+            raise EventConversionException(
+                "Invalid FirebaseDB event payload: missing 'domain'"
+            )
+
+        domain = event_data["domain"]
+        location = "us-central1"
+        if domain != "firebaseio.com":
+            location = domain.split(".")[0]
+
+        resource = f"projects/_/locations/{location}/{resource}"
+        source = f"//{service}/{resource}"
+
+    metadata = {
+        "id": context.event_id,
+        "time": context.timestamp,
+        "specversion": _CLOUD_EVENT_SPEC_VERSION,
+        "datacontenttype": "application/json",
+        "type": new_type,
+        "source": source,
+    }
+
+    if subject:
+        metadata["subject"] = subject
+
+    return CloudEvent(metadata, data)
+
+
 def is_convertable_cloud_event(request) -> bool:
     """Is the given request a known CloudEvent that can be converted to background event."""
     if is_binary(request.headers):
@@ -208,9 +279,73 @@ def _split_ce_source(source) -> Tuple[str, str]:
 
 
 def cloud_event_to_background_event(request) -> Tuple[Any, Context]:
-    """Converts a background event represented by the given HTTP request into a CloudEvent."""
+    """Converts a CloudEvent from an HTTP request into a data and Context tuple."""
     try:
         event = from_http(request.headers, request.get_data())
+        data = event.data
+        service, name = _split_ce_source(event["source"])
+
+        if event["type"] not in _CE_TO_BACKGROUND_TYPE:
+            raise EventConversionException(
+                f'Unable to find background event equivalent type for "{event["type"]}"'
+            )
+
+        if service == _PUBSUB_CE_SERVICE:
+            resource = {"service": service, "name": name, "type": _PUBSUB_MESSAGE_TYPE}
+            if "message" in data:
+                data = data["message"]
+            if "messageId" in data:
+                del data["messageId"]
+            if "publishTime" in data:
+                del data["publishTime"]
+        elif service == _FIREBASE_AUTH_CE_SERVICE:
+            resource = name
+            if "metadata" in data:
+                for old, new in _FIREBASE_AUTH_METADATA_FIELDS_CE_TO_BACKGROUND.items():
+                    if old in data["metadata"]:
+                        data["metadata"][new] = data["metadata"][old]
+                        del data["metadata"][old]
+        elif service == _STORAGE_CE_SERVICE:
+            resource = {
+                "name": f"{name}/{event['subject']}",
+                "service": service,
+                "type": data["kind"],
+            }
+        elif service == _FIREBASE_DB_CE_SERVICE:
+            name = re.sub("/locations/[^/]+", "", name)
+            resource = f"{name}/{event['subject']}"
+        else:
+            resource = f"{name}/{event['subject']}"
+
+        context = Context(
+            eventId=event["id"],
+            timestamp=event["time"],
+            eventType=_CE_TO_BACKGROUND_TYPE[event["type"]],
+            resource=resource,
+        )
+        return (data, context)
+    except (AttributeError, KeyError, TypeError, MissingRequiredFields):
+        raise EventConversionException(
+            "Failed to convert CloudEvent to BackgroundEvent."
+        )
+
+
+async def cloud_event_to_background_event_async(request) -> Tuple[Any, Context]:
+    """Async version of cloud_event_to_background_event for ASGI frameworks."""
+    try:
+        # For Starlette requests, get_data and get_json need to handle async
+        if hasattr(request, 'body') and asyncio.iscoroutinefunction(request.body):
+            body = await request.body()
+        else:
+            body = request.get_data()
+            
+        # Get headers (convert to dict if needed for Starlette)
+        if hasattr(request.headers, 'items'):
+            headers = {k.lower(): v for k, v in request.headers.items()}
+        else:
+            headers = request.headers
+            
+        event = from_http(headers, body)
         data = event.data
         service, name = _split_ce_source(event["source"])
 
@@ -298,6 +433,42 @@ def marshal_background_event_data(request):
     a background event"""
     try:
         request_data = request.get_json()
+        if not _is_raw_pubsub_payload(request_data):
+            # If this in not a raw Pub/Sub request, return the unaltered request data.
+            return request_data
+        return {
+            "context": {
+                "eventId": request_data["message"]["messageId"],
+                "timestamp": request_data["message"].get(
+                    "publishTime", datetime.utcnow().isoformat() + "Z"
+                ),
+                "eventType": _PUBSUB_EVENT_TYPE,
+                "resource": {
+                    "service": _PUBSUB_CE_SERVICE,
+                    "type": _PUBSUB_MESSAGE_TYPE,
+                    "name": _parse_pubsub_topic(request.path),
+                },
+            },
+            "data": {
+                "@type": _PUBSUB_MESSAGE_TYPE,
+                "data": request_data["message"]["data"],
+                "attributes": request_data["message"].get("attributes", {}),
+            },
+        }
+    except (AttributeError, KeyError, TypeError):
+        raise EventConversionException("Failed to convert Pub/Sub payload to event")
+
+
+async def marshal_background_event_data_async(request):
+    """Async version of marshal_background_event_data for ASGI frameworks."""
+    try:
+        # For Starlette requests, get_json is an async function we added
+        if hasattr(request, 'get_json') and asyncio.iscoroutinefunction(request.get_json):
+            request_data = await request.get_json()
+        else:
+            # Fallback for non-async get_json
+            request_data = request.get_json()
+            
         if not _is_raw_pubsub_payload(request_data):
             # If this in not a raw Pub/Sub request, return the unaltered request data.
             return request_data
