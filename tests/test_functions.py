@@ -382,6 +382,23 @@ def test_http_function_flask_render_template():
     )
 
 
+def test_http_function_starlette_render_template():
+    """Test async function with Starlette template rendering."""
+    source = TEST_FUNCTIONS_DIR / "http_starlette_template" / "main.py"
+    target = "function"
+    
+    from functions_framework import create_asgi_app
+    from starlette.testclient import TestClient
+    
+    app = create_asgi_app(target=target, source=source)
+    client = TestClient(app)
+    
+    response = client.get("/?message=test_message")
+    
+    assert response.status_code == 200
+    assert "<h1>Hello test_message!</h1>" in response.text
+
+
 def test_http_function_with_import():
     source = TEST_FUNCTIONS_DIR / "http_with_import" / "main.py"
     target = "function"

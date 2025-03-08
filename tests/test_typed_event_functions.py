@@ -121,3 +121,35 @@ def test_missing_parameter_typed_decorator():
 def test_missing_to_dict_typed_decorator(typed_decorator_missing_to_dict):
     resp = typed_decorator_missing_to_dict.post("/", json={"name": "john", "age": 10})
     assert resp.status_code == 500
+
+
+def test_async_typed_event_function():
+    """Test async typed event function using ASGI app."""
+    source = TEST_FUNCTIONS_DIR / "typed_events" / "async_typed_event.py"
+    target = "async_function_typed"
+    
+    from functions_framework import create_asgi_app
+    from starlette.testclient import TestClient
+    
+    app = create_asgi_app(target=target, source=source, signature_type="typed")
+    client = TestClient(app)
+    
+    response = client.post("/", json={"name": "Alice", "age": 30})
+    assert response.status_code == 200
+    assert response.json() == {"name": "Alice", "age": 31}
+
+
+def test_async_typed_event_function_primitive_return():
+    """Test async typed event function returning a primitive value."""
+    source = TEST_FUNCTIONS_DIR / "typed_events" / "async_typed_event.py"
+    target = "async_function_typed_string_return"
+    
+    from functions_framework import create_asgi_app
+    from starlette.testclient import TestClient
+    
+    app = create_asgi_app(target=target, source=source, signature_type="typed")
+    client = TestClient(app)
+    
+    response = client.post("/", json={"name": "Bob", "age": 25})
+    assert response.status_code == 200
+    assert response.text == "Hello Bob, you are 25 years old"

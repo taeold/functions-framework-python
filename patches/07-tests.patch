@@ -1,0 +1,488 @@
+diff --git a/tests/test_async_functions.py b/tests/test_async_functions.py
+new file mode 100644
+index 0000000..c7b02a4
+--- /dev/null
++++ b/tests/test_async_functions.py
+@@ -0,0 +1,258 @@
++"""Test async function handling in Functions Framework."""
++
++import asyncio
++import json
++import pytest
++import httpx
++from starlette.testclient import TestClient
++from functions_framework import create_app, create_asgi_app
++
++
++def test_async_http_function_with_wsgi(temp_function, test_client):
++    """Test async HTTP function using WSGI app (Flask)."""
++    source = temp_function("""
++import asyncio
++from flask import jsonify
++
++async def function(request):
++    await asyncio.sleep(0.1)
++    return jsonify({"message": "Hello Async"})
++""")
++    
++    client = test_client(source)
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"message": "Hello Async"}
++
++
++def test_async_http_function_with_asgi(temp_function):
++    """Test async HTTP function using ASGI app (Starlette)."""
++    source = temp_function("""
++import asyncio
++
++async def function(request):
++    await asyncio.sleep(0.1)
++    return {"message": "Hello Async ASGI"}
++""")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"message": "Hello Async ASGI"}
++
++
++def test_sync_http_function_with_asgi(temp_function):
++    """Test sync HTTP function using ASGI app."""
++    source = temp_function("""
++def function(request):
++    return {"message": "Hello Sync via ASGI"}
++""")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"message": "Hello Sync via ASGI"}
++
++
++def test_async_with_starlette_specific_features(temp_function):
++    """Test async function using Starlette-specific features."""
++    source = temp_function("""
++import asyncio
++from starlette.responses import StreamingResponse
++
++async def function(request):
++    async def number_generator():
++        for i in range(5):
++            await asyncio.sleep(0.01)
++            yield f"{i}\\n".encode()
++            
++    return StreamingResponse(number_generator())
++""")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.text == "0\n1\n2\n3\n4\n"
++
++
++def test_async_cloud_event_function(temp_function):
++    """Test async CloudEvent function using ASGI app."""
++    source = temp_function("""
++import asyncio
++from cloudevents.http import CloudEvent
++
++async def function(cloud_event):
++    await asyncio.sleep(0.1)
++    # Just validate that we can access CloudEvent data
++    assert cloud_event["id"] is not None
++    assert cloud_event.data is not None
++    return
++""")
++    
++    app = create_asgi_app(target="function", source=source, signature_type="cloudevent")
++    client = TestClient(app)
++    
++    cloud_event = {
++        "specversion": "1.0",
++        "type": "example.test",
++        "source": "https://example.com/events",
++        "id": "123",
++        "data": {"message": "Hello"}
++    }
++    
++    response = client.post(
++        "/",
++        json=cloud_event,
++        headers={"Content-Type": "application/cloudevents+json"}
++    )
++    assert response.status_code == 200
++
++
++def test_async_background_function_with_asgi(temp_function):
++    """Test async background event function using ASGI app."""
++    source = temp_function("""
++import asyncio
++
++async def function(data, context):
++    await asyncio.sleep(0.1)
++    assert data["message"] == "Hello"
++    assert context.event_id is not None
++    return
++""")
++    
++    app = create_asgi_app(target="function", source=source, signature_type="event")
++    client = TestClient(app)
++    
++    event_data = {
++        "context": {
++            "eventId": "abc123",
++            "timestamp": "2020-01-01T00:00:00Z",
++            "eventType": "example.event",
++            "resource": "example-resource",
++        },
++        "data": {
++            "message": "Hello"
++        }
++    }
++    
++    response = client.post("/", json=event_data)
++    assert response.status_code == 200
++
++
++def test_async_function_error_handling(temp_function):
++    """Test error handling in async functions with ASGI app."""
++    source = temp_function("""
++import asyncio
++
++async def function(request):
++    await asyncio.sleep(0.1)
++    raise ValueError("Test error")
++""")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 500
++    assert "Test error" in response.text
++
++
++def test_async_function_with_custom_response(temp_function):
++    """Test async function returning custom response with ASGI app."""
++    source = temp_function("""
++import asyncio
++from starlette.responses import JSONResponse
++
++async def function(request):
++    await asyncio.sleep(0.1)
++    return JSONResponse(
++        content={"message": "Custom response"},
++        status_code=201,
++        headers={"X-Test": "test"}
++    )
++""")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 201
++    assert response.json() == {"message": "Custom response"}
++    assert response.headers["X-Test"] == "test"
++
++
++def test_auto_detection_async(temp_function):
++    """Test automatic detection of async function."""
++    source = temp_function("""
++import asyncio
++import functions_framework
++
++@functions_framework.http
++async def function(request):
++    await asyncio.sleep(0.1)
++    return {"detected": "async"}
++""")
++    
++    # The http decorator should register the function as async
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"detected": "async"}
++
++
++def test_auto_detection_sync(temp_function):
++    """Test automatic detection of sync function."""
++    source = temp_function("""
++import functions_framework
++
++@functions_framework.http
++def function(request):
++    return {"detected": "sync"}
++""")
++    
++    # The http decorator should register the function as sync
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"detected": "sync"}
++
++
++def test_execution_context_in_async(temp_function, monkeypatch):
++    """Test that execution context is accessible in async functions."""
++    source = temp_function("""
++import asyncio
++import functions_framework
++from functions_framework import execution_id
++
++@functions_framework.http
++async def function(request):
++    # We can access execution context in async functions
++    context = execution_id._get_current_context()
++    await asyncio.sleep(0.1)
++    # Still available after await
++    assert context == execution_id._get_current_context()
++    return {"execution_id": context.execution_id if context else None}
++""")
++    
++    # Set environment variable to enable execution ID logging
++    monkeypatch.setenv("LOG_EXECUTION_ID", "true")
++    
++    # Set a fixed execution ID for testing
++    monkeypatch.setattr(execution_id, "_generate_execution_id", lambda: "test-exec-id")
++    
++    app = create_asgi_app(target="function", source=source)
++    client = TestClient(app)
++    
++    response = client.get("/")
++    assert response.status_code == 200
++    assert response.json() == {"execution_id": "test-exec-id"}
+diff --git a/tests/test_functions/http_starlette_template/main.py b/tests/test_functions/http_starlette_template/main.py
+new file mode 100644
+index 0000000..2daf0ea
+--- /dev/null
++++ b/tests/test_functions/http_starlette_template/main.py
+@@ -0,0 +1,37 @@
++# Copyright 2025 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Function used to test template rendering with Starlette in async context."""
++import asyncio
++
++
++async def function(request):
++    """Test HTTP function that renders a template using Starlette.
++    
++    Args:
++        request: The Starlette Request object
++        
++    Returns:
++        A TemplateResponse with the rendered template
++    """
++    # Access templates from app state
++    templates = request.app.state.templates
++    
++    # Get message from query parameters or default to "World"
++    message = request.query_params.get("message", "World")
++    
++    # Simulate some async processing
++    await asyncio.sleep(0.1)
++    
++    # Render template with context
++    return templates.TemplateResponse("hello.html", {"request": request, "name": message})
+diff --git a/tests/test_functions/http_starlette_template/templates/hello.html b/tests/test_functions/http_starlette_template/templates/hello.html
+new file mode 100644
+index 0000000..a9ef18c
+--- /dev/null
++++ b/tests/test_functions/http_starlette_template/templates/hello.html
+@@ -0,0 +1,6 @@
++<\!doctype html>
++<html>
++   <body>
++      <h1>Hello {{ name }}\!</h1>
++   </body>
++</html>
+\ No newline at end of file
+diff --git a/tests/test_functions/typed_events/async_typed_event.py b/tests/test_functions/typed_events/async_typed_event.py
+new file mode 100644
+index 0000000..13f3ce3
+--- /dev/null
++++ b/tests/test_functions/typed_events/async_typed_event.py
+@@ -0,0 +1,84 @@
++# Copyright 2025 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Function used to test handling async functions using typed decorators."""
++import asyncio
++from typing import Any, Type, TypeVar, cast
++
++import functions_framework
++
++T = TypeVar("T")
++
++
++def from_str(x: Any) -> str:
++    assert isinstance(x, str)
++    return x
++
++
++def from_int(x: Any) -> int:
++    assert isinstance(x, int) and not isinstance(x, bool)
++    return x
++
++
++class AsyncTestType:
++    name: str
++    age: int
++
++    def __init__(self, name: str, age: int) -> None:
++        self.name = name
++        self.age = age
++
++    @staticmethod
++    def from_dict(obj: dict) -> "AsyncTestType":
++        name = from_str(obj.get("name"))
++        age = from_int(obj.get("age"))
++        return AsyncTestType(name, age)
++
++    def to_dict(self) -> dict:
++        result: dict = {}
++        result["name"] = from_str(self.name)
++        result["age"] = from_int(self.age)
++        return result
++
++
++@functions_framework.typed(AsyncTestType)
++async def async_function_typed(testType: AsyncTestType):
++    """Async function that returns a typed object.
++    
++    Args:
++        testType: The input typed object
++        
++    Returns:
++        The same object with the age incremented by 1
++    """
++    # Simulate some async processing
++    await asyncio.sleep(0.1)
++    # Modify the object
++    testType.age += 1
++    return testType
++
++
++@functions_framework.typed(AsyncTestType)
++async def async_function_typed_string_return(testType: AsyncTestType):
++    """Async function that returns a string.
++    
++    Args:
++        testType: The input typed object
++        
++    Returns:
++        A string greeting
++    """
++    # Simulate some async processing
++    await asyncio.sleep(0.1)
++    return f"Hello {testType.name}, you are {testType.age} years old"
+diff --git a/tests/test_functions.py b/tests/test_functions.py
+index 7ddc3cc..6a0f7b7 100644
+--- a/tests/test_functions.py
++++ b/tests/test_functions.py
+@@ -381,6 +381,23 @@ def test_http_function_flask_render_template():
+     )
+ 
+ 
++def test_http_function_starlette_render_template():
++    """Test async function with Starlette template rendering."""
++    source = TEST_FUNCTIONS_DIR / "http_starlette_template" / "main.py"
++    target = "function"
++    
++    from functions_framework import create_asgi_app
++    from starlette.testclient import TestClient
++    
++    app = create_asgi_app(target=target, source=source)
++    client = TestClient(app)
++    
++    response = client.get("/?message=test_message")
++    
++    assert response.status_code == 200
++    assert "<h1>Hello test_message\!</h1>" in response.text
++
++
+ def test_http_function_with_import():
+     source = TEST_FUNCTIONS_DIR / "http_with_import" / "main.py"
+     target = "function"
+diff --git a/tests/test_typed_event_functions.py b/tests/test_typed_event_functions.py
+index 33a05d0..6b8a975 100644
+--- a/tests/test_typed_event_functions.py
++++ b/tests/test_typed_event_functions.py
+@@ -15,7 +15,7 @@ import pathlib
+ 
+ import pytest
+ 
+-from functions_framework import create_app
++from functions_framework import create_app, create_asgi_app
+ from functions_framework.exceptions import FunctionsFrameworkException
+ 
+ TEST_FUNCTIONS_DIR = pathlib.Path(__file__).resolve().parent / "test_functions"
+@@ -121,3 +121,35 @@ def test_missing_parameter_typed_decorator():
+ def test_missing_to_dict_typed_decorator(typed_decorator_missing_to_dict):
+     resp = typed_decorator_missing_to_dict.post("/", json={"name": "john", "age": 10})
+     assert resp.status_code == 500
++
++
++def test_async_typed_event_function():
++    """Test async typed event function using ASGI app."""
++    source = TEST_FUNCTIONS_DIR / "typed_events" / "async_typed_event.py"
++    target = "async_function_typed"
++    
++    from starlette.testclient import TestClient
++    
++    app = create_asgi_app(target=target, source=source, signature_type="typed")
++    client = TestClient(app)
++    
++    response = client.post("/", json={"name": "Alice", "age": 30})
++    assert response.status_code == 200
++    assert response.json() == {"name": "Alice", "age": 31}
++
++
++def test_async_typed_event_function_primitive_return():
++    """Test async typed event function returning a primitive value."""
++    source = TEST_FUNCTIONS_DIR / "typed_events" / "async_typed_event.py"
++    target = "async_function_typed_string_return"
++    
++    from starlette.testclient import TestClient
++    
++    app = create_asgi_app(target=target, source=source, signature_type="typed")
++    client = TestClient(app)
++    
++    response = client.post("/", json={"name": "Bob", "age": 25})
++    assert response.status_code == 200
++    assert response.text == "Hello Bob, you are 25 years old"
++
++

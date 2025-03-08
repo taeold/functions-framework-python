@@ -1,0 +1,243 @@
+diff --git a/src/functions_framework/execution_id.py b/src/functions_framework/execution_id.py
+index 1ed1c3f..5cd90e2 100644
+--- a/src/functions_framework/execution_id.py
++++ b/src/functions_framework/execution_id.py
+@@ -20,7 +20,9 @@ import random
+ import re
+ import string
+ import sys
++import contextvars
+ from typing import Dict, Optional, Any, Union, Callable
++import asyncio
+ 
+ # Import Flask and related modules conditionally
+ # We use a consistent import pattern with None values when imports fail
+@@ -49,9 +51,54 @@ TRACE_CONTEXT_REQUEST_HEADER = "X-Cloud-Trace-Context"
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Context variable for storing execution context in ASGI apps
++execution_context_var = contextvars.ContextVar("execution_context", default=None)
++
+ 
+ class ExecutionContext:
+-    def __init__(self, execution_id=None, span_id=None):
++    def __init__(self, execution_id=None, span_id=None):
+         self.execution_id = execution_id
+         self.span_id = span_id
+ 
++
++def _get_current_context() -> Optional[ExecutionContext]:
++    """Get the current execution context.
++    
++    Returns execution context from the appropriate storage mechanism:
++    - For ASGI apps: retrieves from the contextvars-based storage
++    - For WSGI (Flask) apps: retrieves from flask.g if in request context
++    
++    Returns:
++        The current ExecutionContext object or None if not in a request.
++    """
++    # First check the context variable for ASGI
++    # This works for both ASGI and WSGI since we always set it in both
++    context = execution_context_var.get()
++    if context is not None:
++        return context
++    
++    # Legacy Flask-only approach as fallback
++    if FLASK_AVAILABLE and flask is not None:
++        if flask.has_request_context() and hasattr(flask.g, "execution_id_context"):
++            return flask.g.execution_id_context
++    
++    return None
++
++
++def _set_current_context(context: ExecutionContext) -> Optional[contextvars.Token]:
++    """Set the current execution context.
++    
++    Sets execution context in the appropriate storage mechanism:
++    - For all apps: sets in contextvars-based storage
++    - For WSGI (Flask) apps: also sets in flask.g if in request context
++    
++    Args:
++        context: The ExecutionContext to store
++        
++    Returns:
++        Token for resetting context if using contextvars, or None
++    """
++    # Always set the context variable - works for both ASGI and WSGI
++    token = execution_context_var.set(context)
++    
++    # Also set in Flask if available and in request context (legacy approach)
++    if FLASK_AVAILABLE and flask is not None:
++        if flask.has_request_context():
++            flask.g.execution_id_context = context
++            
++    return token
++
++
+ def _generate_execution_id() -> str:
+     """Generate a random execution ID."""
+     return "".join(
+@@ -74,6 +121,51 @@ class WsgiMiddleware:
+         return self.wsgi_app(environ, start_response)
+ 
+ 
++# ASGI middleware to add execution id to request
++class AsgiMiddleware:
++    """ASGI middleware that ensures an execution ID for each request.
++    
++    This middleware:
++    1. Checks if the request has an execution ID header
++    2. If not, generates a new execution ID and adds it to the request headers
++    3. Passes the request to the next middleware or application
++    
++    The execution ID can then be accessed by the application code
++    through `_get_current_context()`.
++    """
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        # Only process HTTP requests, pass through other types
++        if scope.get("type") \!= "http":
++            return await self.app(scope, receive, send)
++        
++        # Find execution_id in headers
++        execution_id = None
++        header_name_bytes = EXECUTION_ID_REQUEST_HEADER.lower().encode()
++        
++        for header_name, header_value in scope.get("headers", []):
++            if header_name.lower() == header_name_bytes:
++                # Header exists, get its value
++                execution_id = header_value.decode("utf-8", errors="replace")
++                break
++        
++        # If no execution ID found, generate one and add it to headers
++        if not execution_id:
++            execution_id = _generate_execution_id()
++            
++            # Create a new headers list with our execution ID added
++            headers = list(scope.get("headers", []))
++            headers.append((header_name_bytes, execution_id.encode("utf-8")))
++            scope["headers"] = headers
++        
++        # Pass the modified scope to the next middleware/application
++        return await self.app(scope, receive, send)
++
++
+ # Sets execution id and span id for the Flask request
+ def set_execution_context(request, enable_id_logging=False):
+     if enable_id_logging:
+@@ -91,7 +183,7 @@ def set_execution_context(request, enable_id_logging=False):
+                 _TRACE_CONTEXT_REGEX_PATTERN,
+                 request.headers.get(TRACE_CONTEXT_REQUEST_HEADER, ""),
+             )
+-            flask.g.execution_id_context = ExecutionContext(
++            _set_current_context(ExecutionContext(
+                 request.headers.get(EXECUTION_ID_REQUEST_HEADER),
+                 trace_context.group("span_id") if trace_context else None,
+             )
+@@ -103,6 +195,91 @@ def set_execution_context(request, enable_id_logging=False):
+     return decorator
+ 
+ 
++# Sets execution id and span id for ASGI (Starlette) requests
++def set_asgi_execution_context(enable_id_logging=False):
++    """ASGI-compatible execution context setter for Starlette requests.
++    
++    This decorator:
++    1. Extracts execution ID and span ID from request headers
++    2. Sets them in the context variables storage
++    3. Runs the handler function
++    4. Resets the context afterwards
++    
++    Args:
++        enable_id_logging: Whether to configure logging to include execution IDs
++        
++    Returns:
++        A decorator function that wraps the handler function
++    """
++    # Set up output redirection once, not on every request
++    if enable_id_logging:
++        stdout_handler = LoggingHandlerAddExecutionId(sys.stdout)
++        stderr_handler = LoggingHandlerAddExecutionId(sys.stderr)
++        stdout_redirect = contextlib.redirect_stdout(stdout_handler)
++        stderr_redirect = contextlib.redirect_stderr(stderr_handler)
++    else:
++        stdout_redirect = contextlib.nullcontext()
++        stderr_redirect = contextlib.nullcontext()
++
++    # The actual decorator function
++    def decorator(func):
++        # Extract common header processing code to avoid duplication
++        def _extract_context_from_headers(request):
++            # Get trace context if available
++            trace_context_header = request.headers.get(TRACE_CONTEXT_REQUEST_HEADER, "")
++            trace_context = re.match(_TRACE_CONTEXT_REGEX_PATTERN, trace_context_header)
++            span_id = trace_context.group("span_id") if trace_context else None
++            
++            # Get execution ID from headers or create one
++            execution_id = request.headers.get(EXECUTION_ID_REQUEST_HEADER)
++            if not execution_id:
++                execution_id = _generate_execution_id()
++                
++            return ExecutionContext(execution_id, span_id)
++        
++        # For async functions (coroutines)
++        if asyncio.iscoroutinefunction(func):
++            @functools.wraps(func)
++            async def async_wrapper(request, *args, **kwargs):
++                # Extract and set context
++                context = _extract_context_from_headers(request)
++                token = _set_current_context(context)
++                
++                # Execute the function with context and clean up after
++                try:
++                    with stderr_redirect, stdout_redirect:
++                        return await func(request, *args, **kwargs)
++                finally:
++                    if token:
++                        execution_context_var.reset(token)
++            
++            return async_wrapper
++        
++        # For synchronous functions
++        else:
++            @functools.wraps(func)
++            def sync_wrapper(request, *args, **kwargs):
++                # Extract and set context
++                context = _extract_context_from_headers(request)
++                token = _set_current_context(context)
++                
++                # Execute the function with context and clean up after
++                try:
++                    with stderr_redirect, stdout_redirect:
++                        return func(request, *args, **kwargs)
++                finally:
++                    if token:
++                        execution_context_var.reset(token)
++            
++            return sync_wrapper
++    
++    return decorator
++
++
+ # Only define the LocalProxy if Flask is available
+ if FLASK_AVAILABLE:
+     @LocalProxy
+@@ -125,7 +302,9 @@ class LoggingHandlerAddExecutionId(io.TextIOWrapper):
+     def write(self, contents):
+         if contents == "\n":
+             return
+-        context = flask.g.execution_id_context if flask.has_request_context() else None
++        current_context = _get_current_context()
++        if current_context is None:
++            self.stream.write(contents + "\n")
++            self.stream.flush()
++            return
+         try:
+-            execution_id = context.execution_id if context else None
+-            span_id = context.span_id if context else None
++            execution_id = current_context.execution_id
++            span_id = current_context.span_id
+             payload = json.loads(contents)

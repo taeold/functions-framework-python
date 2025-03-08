@@ -1,0 +1,222 @@
+diff --git a/src/functions_framework/__init__.py b/src/functions_framework/__init__.py
+index e9107b0..5b04701 100644
+--- a/src/functions_framework/__init__.py
++++ b/src/functions_framework/__init__.py
+@@ -79,6 +79,9 @@ def cloud_event(func: Union[CloudEventFunction, AsyncCloudEventFunction]) -> Uni
+     """Decorator that registers cloudevent as user function signature type."""
+     _REGISTRY_MAP[func.__name__] = (
+         _FUNCTION_REGISTRY.CLOUDEVENT_SIGNATURE_TYPE
++    )
++    
++    # Store whether the function is async or not
++    _function_registry.ASYNC_FUNCTIONS[func.__name__] = inspect.iscoroutinefunction(func)
+ 
+     @functools.wraps(func)
+     def wrapper(*args, **kwargs):
+@@ -122,6 +125,9 @@ def http(func: Union[HTTPFunction, AsyncHTTPFunction]) -> Union[HTTPFunction, As
+     """Decorator that registers http as user function signature type."""
+     _REGISTRY_MAP[func.__name__] = (
+         _FUNCTION_REGISTRY.HTTP_SIGNATURE_TYPE
++    )
++    
++    # Store whether the function is async or not
++    _function_registry.ASYNC_FUNCTIONS[func.__name__] = inspect.iscoroutinefunction(func)
+ 
+     @functools.wraps(func)
+     def wrapper(*args, **kwargs):
+@@ -742,7 +748,8 @@ def create_asgi_app(target: Optional[str] = None,
+     signature_type = _function_registry.get_func_signature_type(target, signature_type)
+     
+     # Check if the function is async
+-    is_async = asyncio.iscoroutinefunction(function)
++    is_async = _function_registry.is_async_func(target)
++    print(f"Function {target} is {'async' if is_async else 'sync'}")
+     
+     # Setup execution context for logging
+     enable_id_logging = _enable_execution_id_logging()
+@@ -787,9 +794,101 @@ def create_asgi_app(target: Optional[str] = None,
+         else:
+             return PlainTextResponse(str(result) if result is not None else "")
+     
++    @execution_id.set_asgi_execution_context(enable_id_logging)
++    async def cloud_event_handler(request):
++        """Handle CloudEvent requests for ASGI.
++        
++        This handler:
++        1. Tries to parse a CloudEvent from the request
++        2. Falls back to background event conversion if that fails
++        3. Runs the function with the event (async or sync)
++        """
++        try:
++            # Ensure request body is fully read
++            body = await ensure_request_body_read(request)
++            
++            # Handle headers from Starlette (case-insensitive dict-like object)
++            headers = {k.lower(): v for k, v in request.headers.items()}
++            
++            # Parse the CloudEvent using CloudEvents SDK
++            event = from_http(headers, body)
++            
++            # Execute the function based on whether it's async or not
++            if is_async:
++                await function(event)
++            else:
++                # Run sync function in an executor to avoid blocking
++                loop = asyncio.get_event_loop()
++                await loop.run_in_executor(None, function, event)
++                
++            return PlainTextResponse("OK")
++        except Exception as first_error:
++            # CloudEvent parsing failed, try background event conversion
++            try:
++                # Ensure request body is fully read again (in case previous error was before reading body)
++                await ensure_request_body_read(request)
++                
++                # Create an adapter for the Starlette request to make it compatible
++                # with our background event conversion function
++                class RequestAdapter:
++                    """Adapter to make Starlette request compatible with event conversion."""
++                    def __init__(self, original_request):
++                        self.original_request = original_request
++                        self.headers = original_request.headers
++                        self.path = original_request.url.path
++                    
++                    async def get_json(self):
++                        """Async method to get JSON data from request."""
++                        return await self.original_request.json()
++                
++                # Create adapter from the original request
++                adapted_request = RequestAdapter(request)
++                
++                # Try converting from background event format
++                event = await event_conversion.background_event_to_cloud_event_async(adapted_request)
++                
++                # Execute the function based on whether it's async or not
++                if is_async:
++                    await function(event)
++                else:
++                    loop = asyncio.get_event_loop()
++                    await loop.run_in_executor(None, function, event)
++                
++                return PlainTextResponse("OK")
++            except EventConversionException as e:
++                # Both parsing methods failed - return detailed error
++                error_detail = (
++                    f"Failed to parse as CloudEvent: {str(first_error)}\n"
++                    f"Failed to convert from background event: {str(e)}"
++                )
++                return PlainTextResponse(
++                    f"Invalid event format: {error_detail}", 
++                    status_code=400
++                )
++
++    @execution_id.set_asgi_execution_context(enable_id_logging)
++    async def event_handler(request):
++        # Handling for background events
++        try:
++            # Ensure request body is fully read
++            await ensure_request_body_read(request)
++            
++            event_data = await request.json()
++            event_object = BackgroundEvent(**event_data)
++            data = event_object.data
++            context = Context(**event_object.context)
++            
++            if is_async:
++                await function(data, context)
++            else:
++                loop = asyncio.get_event_loop()
++                await loop.run_in_executor(None, function, data, context)
++                
++            return PlainTextResponse("OK")
++        except Exception as e:
++            return PlainTextResponse(str(e), status_code=400)
++    
+     # Map signature types to route handlers
+     handler_map = {
+         _function_registry.HTTP_SIGNATURE_TYPE: http_handler,
++        _function_registry.CLOUDEVENT_SIGNATURE_TYPE: cloud_event_handler,
++        _function_registry.BACKGROUNDEVENT_SIGNATURE_TYPE: event_handler,
+     }
+     
+     # Select the appropriate handler based on signature type
+diff --git a/src/functions_framework/_function_registry.py b/src/functions_framework/_function_registry.py
+index 33a05d0..6b8a975 100644
+--- a/src/functions_framework/_function_registry.py
++++ b/src/functions_framework/_function_registry.py
+@@ -16,6 +16,7 @@ import importlib.util
+ import inspect
+ import os
+ import typing
++import asyncio
+ 
+ from functions_framework.exceptions import (
+     FunctionsFrameworkException,
+@@ -29,6 +30,7 @@ BACKGROUNDEVENT_SIGNATURE_TYPE = "event"
+ HTTP_SIGNATURE_TYPE = "http"
+ TYPED_SIGNATURE_TYPE = "typed"
+ REGISTRY_MAP = {}
++ASYNC_FUNCTIONS = {}  # Track whether a function is async or not
+ 
+ 
+ def get_function_target(target: str = None) -> str:
+@@ -170,3 +172,17 @@ def get_func_input_type(func_name: str) -> typing.Type:
+     """Get input type for given function if available."""
+     from functions_framework import _typed_event
+     return _typed_event.get_input_type(func_name)
++
++
++def is_async_func(target: str = None) -> bool:
++    """Determine if a function is async or not.
++    
++    Args:
++        target: The name of the function to check
++        
++    Returns:
++        True if the function is async, False otherwise
++    """
++    if target in ASYNC_FUNCTIONS:
++        return ASYNC_FUNCTIONS[target]
++    return False
+diff --git a/src/functions_framework/event_conversion.py b/src/functions_framework/event_conversion.py
+index b8d9c1f..6d6cbff 100755
+--- a/src/functions_framework/event_conversion.py
++++ b/src/functions_framework/event_conversion.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import base64
++import asyncio
+ import datetime
+ import json
+ import os
+@@ -266,3 +267,28 @@ def background_event_to_cloud_event(request) -> CloudEvent:
+         raise EventConversionException(
+             f"Failed to convert background event to CloudEvent: {e}"
+         ) from e
++
++
++async def background_event_to_cloud_event_async(request) -> CloudEvent:
++    """Convert a background function event to a CloudEvent.
++    Async version for ASGI applications.
++    
++    Args:
++        request: The request containing the event data, must have an async get_json() method
++        
++    Returns:
++        A CloudEvent created from the background event
++        
++    Raises:
++        EventConversionException: If the event data could not be parsed or converted
++    """
++    try:
++        # Get the JSON data from the request
++        event_data = await request.get_json()
++        
++        # Delegate to the synchronous function for the actual conversion
++        event_object = BackgroundEvent(**event_data)
++        return _background_event_to_cloud_event(event_object)
++    except Exception as e:
++        raise EventConversionException(
++            f"Failed to convert background event to CloudEvent: {e}"
++        ) from e

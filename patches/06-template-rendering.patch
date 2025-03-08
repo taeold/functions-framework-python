@@ -1,0 +1,45 @@
+diff --git a/src/functions_framework/__init__.py b/src/functions_framework/__init__.py
+index 1c19458..7a31b69 100644
+--- a/src/functions_framework/__init__.py
++++ b/src/functions_framework/__init__.py
+@@ -969,9 +969,28 @@ def create_asgi_app(target: Optional[str] = None,
+     else:
+         # For event-based handlers, only accept POST
+         routes = [
+             Route("/", handler, methods=["POST"]),
+             Route("/{path:path}", handler, methods=["POST"]),
+         ]
++        
++    # Set up templates directory 
++    template_folder = str(pathlib.Path(source).parent / "templates")
++    template_config = None
++    
++    # Only set up Jinja templates if the templates directory exists
++    if os.path.exists(template_folder):
++        try:
++            from starlette.templating import Jinja2Templates
++            template_config = Jinja2Templates(directory=template_folder)
++        except ImportError:
++            # Log warning but continue - templates just won't be available
++            logging.warning(
++                "Templates directory found but jinja2 is not installed. "
++                "Install with: pip install jinja2"
++            )
++    
++    # Fix to prevent issues with relative imports in the source file
++    sys.path.insert(0, os.path.dirname(source))
+     
+     # Add the execution ID middleware
+     middleware = [
+@@ -984,6 +1003,11 @@ def create_asgi_app(target: Optional[str] = None,
+         middleware=middleware
+     )
+     
++    # Store template config in app state if available
++    if template_config:
++        app.state.templates = template_config
++        
++    
+     # Error handler for crash reports
+     @app.exception_handler(Exception)
+     async def exception_handler(request, exc):

@@ -470,8 +470,28 @@ def create_asgi_app(target: Optional[str] = None,
     enable_id_logging = _enable_execution_id_logging()
 
     # Define route handlers for each signature type
+    # Middleware to ensure entire request body is read
+    async def ensure_request_body_read(request):
+        """Ensure the request body is completely read before processing.
+        
+        This helps prevent connection errors similar to the read_request
+        function in the Flask implementation.
+        
+        Args:
+            request: The Starlette request object
+            
+        Returns:
+            The request body as bytes
+        """
+        # Force reading the entire body
+        body = await request.body()
+        return body
+    
     @execution_id.set_asgi_execution_context(enable_id_logging)
     async def http_handler(request):
+        # Ensure request body is fully read
+        await ensure_request_body_read(request)
+        
         if is_async:
             result = await function(request)
         else:
@@ -500,8 +520,9 @@ def create_asgi_app(target: Optional[str] = None,
         3. Runs the function with the event (async or sync)
         """
         try:
-            # First try to parse as a native CloudEvent
-            body = await request.body()
+            # Ensure request body is fully read
+            body = await ensure_request_body_read(request)
+            
             # Handle headers from Starlette (case-insensitive dict-like object)
             headers = {k.lower(): v for k, v in request.headers.items()}
             
@@ -533,6 +554,9 @@ def create_asgi_app(target: Optional[str] = None,
                         """Async method to get JSON data from request."""
                         return await self.original_request.json()
                 
+                # Ensure request body is fully read again (in case previous error was before reading body)
+                await ensure_request_body_read(request)
+                
                 # Create adapter from the original request
                 adapted_request = RequestAdapter(request)
                 
@@ -562,6 +586,9 @@ def create_asgi_app(target: Optional[str] = None,
     async def event_handler(request):
         # Handling for background events
         try:
+            # Ensure request body is fully read
+            await ensure_request_body_read(request)
+            
             event_data = await request.json()
             event_object = BackgroundEvent(**event_data)
             data = event_object.data
@@ -577,11 +604,87 @@ def create_asgi_app(target: Optional[str] = None,
         except Exception as e:
             return PlainTextResponse(str(e), status_code=400)
 
+    # Define handler for typed events
+    @execution_id.set_asgi_execution_context(enable_id_logging)
+    async def typed_event_handler(request):
+        """Handle typed event requests for ASGI.
+        
+        This handler:
+        1. Parses the JSON request body
+        2. Converts it to the expected input type
+        3. Calls the function with the typed input
+        4. Converts the response back to JSON
+        """
+        try:
+            # Get the input type for this function
+            input_type = _function_registry.get_func_input_type(target)
+            if not input_type:
+                return PlainTextResponse(
+                    f"Function {target} has no registered input type",
+                    status_code=500
+                )
+            
+            # Ensure request body is fully read
+            await ensure_request_body_read(request)
+            
+            # Parse request JSON
+            try:
+                data = await request.json()
+            except Exception as e:
+                return PlainTextResponse(
+                    f"Invalid JSON payload: {str(e)}", 
+                    status_code=400
+                )
+            
+            # Convert to typed input
+            try:
+                input_obj = input_type.from_dict(data)
+            except Exception as e:
+                return PlainTextResponse(
+                    f"Failed to convert input to {input_type.__name__}: {str(e)}", 
+                    status_code=400
+                )
+            
+            # Call the function with typed input
+            if is_async:
+                response = await function(input_obj)
+            else:
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, function, input_obj)
+            
+            # Handle the response
+            if response is None:
+                return PlainTextResponse("")
+            
+            # For primitive types
+            if response.__class__.__module__ == "builtins":
+                if isinstance(response, (str, int, float, bool)):
+                    return PlainTextResponse(str(response))
+                else:
+                    return JSONResponse(response)
+            
+            # For custom types, validate and convert to dict
+            try:
+                _typed_event._validate_return_type(response)
+                return JSONResponse(response.to_dict())
+            except Exception as e:
+                return PlainTextResponse(
+                    f"Invalid return type: {str(e)}", 
+                    status_code=500
+                )
+                
+        except Exception as e:
+            return PlainTextResponse(
+                f"Function execution failed: {str(e)}", 
+                status_code=500
+            )
+    
     # Map signature types to route handlers
     handler_map = {
         _function_registry.HTTP_SIGNATURE_TYPE: http_handler,
         _function_registry.CLOUDEVENT_SIGNATURE_TYPE: cloud_event_handler,
         _function_registry.BACKGROUNDEVENT_SIGNATURE_TYPE: event_handler,
+        _function_registry.TYPED_SIGNATURE_TYPE: typed_event_handler,
     }
     
     # Select the appropriate handler based on signature type
@@ -608,12 +711,48 @@ def create_asgi_app(target: Optional[str] = None,
         Middleware(execution_id.AsgiMiddleware)
     ]
     
+    # Set up templates directory 
+    template_folder = str(pathlib.Path(source).parent / "templates")
+    template_config = None
+    
+    # Only set up Jinja templates if the templates directory exists
+    if os.path.exists(template_folder):
+        try:
+            from starlette.templating import Jinja2Templates
+            template_config = Jinja2Templates(directory=template_folder)
+        except ImportError:
+            # Log warning but continue - templates just won't be available
+            logging.warning(
+                "Templates directory found but jinja2 is not installed. "
+                "Install with: pip install jinja2"
+            )
+    
+    # Set up templates directory 
+    template_folder = str(pathlib.Path(source).parent / "templates")
+    template_config = None
+    
+    # Only set up Jinja templates if the templates directory exists
+    if os.path.exists(template_folder):
+        try:
+            from starlette.templating import Jinja2Templates
+            template_config = Jinja2Templates(directory=template_folder)
+        except ImportError:
+            # Log warning but continue - templates just won't be available
+            logging.warning(
+                "Templates directory found but jinja2 is not installed. "
+                "Install with: pip install jinja2"
+            )
+    
     # Create and return Starlette app with middleware
     app = Starlette(
         debug=bool(os.environ.get("DEBUG")), 
         routes=routes,
         middleware=middleware
     )
+    
+    # Store template config in app state if available
+    if template_config:
+        app.state.templates = template_config
     
     # Error handler for crash reports
     @app.exception_handler(Exception)
