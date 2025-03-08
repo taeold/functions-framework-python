@@ -26,10 +26,33 @@ class HTTPServer:
         else:
             try:
                 from functions_framework._http.gunicorn import GunicornApplication
-
                 self.server_class = GunicornApplication
-            except ImportError as e:
+            except ImportError:
                 self.server_class = FlaskApplication
+
+    def run(self, host, port):
+        http_server = self.server_class(
+            self.app, host, port, self.debug, **self.options
+        )
+        http_server.run()
+
+
+class HTTPServerAsync:
+    def __init__(self, app, debug, **options):
+        self.app = app
+        self.debug = debug
+        self.options = options
+
+        if self.debug:
+            from functions_framework._http.starlette import StarletteApplication
+            self.server_class = StarletteApplication
+        else:
+            try:
+                from functions_framework._http.gunicorn import UvicornApplication
+                self.server_class = UvicornApplication
+            except ImportError:
+                from functions_framework._http.starlette import StarletteApplication
+                self.server_class = StarletteApplication
 
     def run(self, host, port):
         http_server = self.server_class(
@@ -40,3 +63,7 @@ class HTTPServer:
 
 def create_server(wsgi_app, debug, **options):
     return HTTPServer(wsgi_app, debug, **options)
+
+
+def create_async_server(asgi_app, debug, **options):
+    return HTTPServerAsync(asgi_app, debug, **options)

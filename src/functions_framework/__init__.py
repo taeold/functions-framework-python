@@ -25,7 +25,7 @@ import sys
 import types
 
 from inspect import signature
-from typing import Callable, Type
+from typing import Any, Callable, Optional, Type
 
 import cloudevents.exceptions as cloud_exceptions
 import flask
@@ -426,6 +426,136 @@ class LazyWSGIApp:
         return self.app(*args, **kwargs)
 
 
+def create_asgi_app(
+    target: Optional[str] = None,
+    source: Optional[str] = None,
+    signature_type: Optional[str] = None,
+) -> Any:
+    """Create a Starlette ASGI application for the function.
+
+    Args:
+        target: The name of the target function to invoke
+        source: The source file containing the function
+        signature_type: The signature type of the function
+                       ('http', 'event', 'cloudevent', or 'typed')
+
+    Returns:
+        A Starlette ASGI application instance
+
+    Raises:
+        ImportError: If Starlette is not installed
+        MissingSourceException: If the source file does not exist
+        FunctionsFrameworkException: If the signature type is invalid
+    """
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.responses import Response, JSONResponse
+    import inspect
+
+    target = _function_registry.get_function_target(target)
+    source = _function_registry.get_function_source(source)
+
+    if not os.path.exists(source):
+        raise MissingSourceException(
+            f"File {source} that is expected to define function doesn't exist"
+        )
+
+    source_module, spec = _function_registry.load_function_module(source)
+
+    try:
+        spec.loader.exec_module(source_module)
+        function = _function_registry.get_user_function(source, source_module, target)
+    except Exception as e:
+        raise FunctionsFrameworkException(
+            f"Failed to load function from {source}: {e}"
+        ) from e
+
+    # Get the configured function signature type
+    signature_type = _function_registry.get_func_signature_type(target, signature_type)
+
+    routes = []
+
+    # Configure routes based on signature type
+    if signature_type == _function_registry.HTTP_SIGNATURE_TYPE:
+        # Check if function is async
+        is_async = inspect.iscoroutinefunction(function)
+
+        async def http_handler(request):
+            if is_async:
+                result = await function(request)
+            else:
+                result = function(request)
+
+            if isinstance(result, Response):
+                return result
+            elif isinstance(result, str):
+                return Response(result)
+            elif isinstance(result, dict):
+                return JSONResponse(result)
+            elif result is None:
+                return Response("")
+            else:
+                return Response(str(result))
+
+        routes.append(
+            Route(
+                "/{path:path}",
+                http_handler,
+                methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
+            )
+        )
+        routes.append(
+            Route(
+                "/",
+                http_handler,
+                methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
+            )
+        )
+
+    elif signature_type == _function_registry.CLOUDEVENT_SIGNATURE_TYPE:
+
+        async def cloudevent_handler(request):
+            # Process CloudEvent request
+            data = await request.body()
+            headers = dict(request.headers)
+
+            # Create CloudEvent from request
+            try:
+                event = from_http(headers, data)
+            except (
+                cloud_exceptions.MissingRequiredFields,
+                cloud_exceptions.InvalidRequiredFields,
+            ) as e:
+                return Response(str(e), status_code=400)
+
+            # Call function with CloudEvent
+            if inspect.iscoroutinefunction(function):
+                await function(event)
+            else:
+                function(event)
+
+            return Response("OK")
+
+        routes.append(Route("/{path:path}", cloudevent_handler, methods=["POST"]))
+        routes.append(Route("/", cloudevent_handler, methods=["POST"]))
+
+    else:
+        # For other event types (background/typed), we'll implement in future
+        raise FunctionsFrameworkException(
+            f"ASGI server doesn't yet support signature type: {signature_type}"
+        )
+
+    app = Starlette(debug=debug, routes=routes)
+
+    @app.exception_handler(Exception)
+    async def exception_handler(request, exc):
+        return Response(
+            str(exc), status_code=500, headers={_FUNCTION_STATUS_HEADER_FIELD: _CRASH}
+        )
+
+    return app
+
+
 def _configure_app_execution_id_logging():
     # Logging needs to be configured before app logger is accessed
     logging.config.dictConfig(
@@ -450,6 +580,29 @@ def _enable_execution_id_logging():
 
 
 app = LazyWSGIApp()
+
+
+class LazyASGIApp:
+    """
+    Wrap the ASGI app in a lazily initialized wrapper to prevent initialization
+    at import-time
+    """
+
+    def __init__(self, target=None, source=None, signature_type=None):
+        self.target = target
+        self.source = source
+        self.signature_type = signature_type
+
+        # Placeholder for the app which will be initialized on first call
+        self.app = None
+
+    async def __call__(self, scope, receive, send):
+        if not self.app:
+            self.app = create_asgi_app(self.target, self.source, self.signature_type)
+        await self.app(scope, receive, send)
+
+
+asgi_app = LazyASGIApp()
 
 
 class DummyErrorHandler:

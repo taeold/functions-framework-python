@@ -53,10 +53,13 @@ setup(
         "flask>=1.0,<4.0",
         "click>=7.0,<9.0",
         "watchdog>=1.0.0",
-        "gunicorn>=22.0.0; platform_system!='Windows'",
         "cloudevents>=1.2.0,<2.0.0",
         "Werkzeug>=0.14,<4.0.0",
     ],
+    extras_require={
+        "asgi": ["starlette>=0.38.0", "uvicorn>=0.28.0"],
+        "prod": ["gunicorn>=22.0.0; platform_system!='Windows'"],
+    },
     entry_points={
         "console_scripts": [
             "ff=functions_framework._cli:_cli",

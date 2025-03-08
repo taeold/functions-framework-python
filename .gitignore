@@ -10,3 +10,7 @@ dist/
 function_output.json
 serverlog_stderr.txt
 serverlog_stdout.txt
+
+pyproject.toml
+.python-version
+uv.lock

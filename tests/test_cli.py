@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from unittest import mock
+
 import pretend
 import pytest
 
@@ -103,3 +106,37 @@ def test_cli(monkeypatch, args, env, create_app_calls, run_calls):
     assert result.exit_code == 0
     assert create_app.calls == create_app_calls
     assert wsgi_server.run.calls == run_calls
+
+
+@pytest.mark.parametrize(
+    "args, env, create_app_calls, run_calls",
+    [
+        (
+            ["--target", "foo", "--gateway-interface", "asgi"],
+            {},
+            [pretend.call("foo", None, "http")],
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+        (
+            [],
+            {"FUNCTION_TARGET": "foo", "GATEWAY_INTERFACE": "asgi"},
+            [pretend.call("foo", None, "http")],
+            [pretend.call("0.0.0.0", 8080)],
+        ),
+    ],
+)
+def test_cli_asgi(monkeypatch, args, env, create_app_calls, run_calls):
+    asgi_server = pretend.stub(run=pretend.call_recorder(lambda *a, **kw: None))
+    asgi_app = pretend.stub(run=pretend.call_recorder(lambda *a, **kw: None))
+    create_asgi_app = pretend.call_recorder(lambda *a, **kw: asgi_app)
+    monkeypatch.setattr(functions_framework._cli, "create_asgi_app", create_asgi_app)
+    create_async_server = pretend.call_recorder(lambda *a, **kw: wsgi_server)
+    monkeypatch.setattr(functions_framework._cli, "create_async_server", create_async_server)
+
+
+    runner = CliRunner(env=env)
+    result = runner.invoke(_cli, args)
+
+    assert result.exit_code == 0
+    assert create_asgi_app.calls == create_app_calls
+    assert asgi_server.run.calls == run_calls
