@@ -418,6 +418,10 @@ def create_app(target=None, source=None, signature_type=None):
         # trade-off.
         from functions_framework.aio import create_asgi_app_from_module
 
+        # # Get the configured function signature type
+        # signature_type = _function_registry.get_func_signature_type(
+        #     target, signature_type
+        # )
         return create_asgi_app_from_module(
             target, source, signature_type, source_module, spec
         )

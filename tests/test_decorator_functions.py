@@ -175,3 +175,31 @@ def test_aio_decorators_register_asgi_functions():
 
     assert "test_http_sync" in registry.ASGI_FUNCTIONS
     assert "test_cloud_event_sync" in registry.ASGI_FUNCTIONS
+
+
+@pytest.fixture
+def async_client_from_create_app():
+    """
+    Provides a test client for an async function by using the main `create_app`
+    entrypoint. This simulates the framework's real-world behavior of
+    detecting the required server type (ASGI) from the function's decorator.
+    """
+    source = TEST_FUNCTIONS_DIR / "decorators" / "async_decorator.py"
+    target = "function_cloud_event"
+    # We call `create_app` here to test its ability to detect and delegate
+    # to the correct ASGI application.
+    app = create_app(target, source)
+    return StarletteTestClient(app)
+
+
+def test_create_app_supports_async_decorator_detection(
+    async_client_from_create_app, cloud_event_1_0
+):
+    """
+    Tests that `create_app` correctly detects the 'cloudevent' signature
+    type from a function decorated with `@aio.cloud_event` and serves it.
+    """
+    headers, data = ce_conversion.to_structured(cloud_event_1_0)
+    resp = async_client_from_create_app.post("/", headers=headers, data=data)
+    assert resp.status_code == 200
+    assert resp.text == "OK"
